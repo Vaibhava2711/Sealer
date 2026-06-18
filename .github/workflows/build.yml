@@ -1,0 +1,63 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Download Poppler
+        run: |
+          curl -L "https://github.com/oschwartz10612/poppler-windows/releases/download/v24.02.0-0/Release-24.02.0-0.zip" -o poppler.zip
+          Expand-Archive poppler.zip -DestinationPath poppler_extracted
+          Move-Item poppler_extracted\poppler-24.02.0\Library\bin poppler_bin
+
+      - name: Download Tesseract portable
+        run: |
+          curl -L "https://github.com/UB-Mannheim/tesseract/releases/download/v5.3.3.20231005/tesseract-ocr-w64-setup-5.3.3.20231005.exe" -o tesseract_setup.exe
+          7z x tesseract_setup.exe -otesseract_extracted -y
+          New-Item -ItemType Directory -Force -Path tesseract_bin
+          Copy-Item tesseract_extracted\tesseract.exe tesseract_bin\
+          Copy-Item tesseract_extracted\*.dll tesseract_bin\ -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path tesseract_bin\tessdata
+          Copy-Item tesseract_extracted\tessdata\eng.traineddata tesseract_bin\tessdata\
+
+      - name: Build EXE with PyInstaller
+        run: |
+          pyinstaller `
+            --onefile `
+            --windowed `
+            --name "DocSealer" `
+            --add-data "poppler_bin;poppler/bin" `
+            --add-data "tesseract_bin;tesseract" `
+            --hidden-import "PIL._tkinter_finder" `
+            --hidden-import "pillow_heif" `
+            --hidden-import "pkg_resources.py2_compat" `
+            --collect-all "pytesseract" `
+            --collect-all "reportlab" `
+            doc_sealer_batch.py
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DocSealer-Windows
+          path: dist/DocSealer.exe
+          retention-days: 30
