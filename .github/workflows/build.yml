@@ -30,15 +30,21 @@ jobs:
           Expand-Archive poppler.zip -DestinationPath poppler_extracted
           Move-Item poppler_extracted\poppler-24.02.0\Library\bin poppler_bin
 
-      - name: Download Tesseract portable
+      - name: Install Tesseract via Chocolatey
         run: |
-          curl -L "https://github.com/UB-Mannheim/tesseract/releases/download/v5.3.3.20231005/tesseract-ocr-w64-setup-5.3.3.20231005.exe" -o tesseract_setup.exe
-          7z x tesseract_setup.exe -otesseract_extracted -y
+          choco install tesseract --yes --no-progress
+          echo "Tesseract installed"
+
+      - name: Copy Tesseract files for bundling
+        run: |
           New-Item -ItemType Directory -Force -Path tesseract_bin
-          Copy-Item tesseract_extracted\tesseract.exe tesseract_bin\
-          Copy-Item tesseract_extracted\*.dll tesseract_bin\ -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path tesseract_bin\tessdata
-          Copy-Item tesseract_extracted\tessdata\eng.traineddata tesseract_bin\tessdata\
+          $tess_dir = "C:\Program Files\Tesseract-OCR"
+          Copy-Item "$tess_dir\tesseract.exe" tesseract_bin\
+          Copy-Item "$tess_dir\*.dll" tesseract_bin\
+          Copy-Item "$tess_dir\tessdata\eng.traineddata" tesseract_bin\tessdata\
+          Write-Host "Tesseract files copied:"
+          Get-ChildItem tesseract_bin
 
       - name: Build EXE with PyInstaller
         run: |
