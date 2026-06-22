@@ -340,14 +340,45 @@ class BatchWorker(QThread):
 
     # ── Step 2: Apply seal overlay ────────────────────────────────────────────
     def _make_seal_overlay(self, w_pt: float, h_pt: float,
-                           seal_img: Image.Image) -> bytes:
+                           seal_img: Image.Image, rotation: int = 0) -> bytes:
+        """
+        Create a PDF overlay page containing the seal at the visual bottom-right.
+
+        w_pt, h_pt  — raw PDF page dimensions (from mediabox, NOT swapped)
+        rotation    — value of /Rotate key (0, 90, 180, 270)
+
+        For rotated pages the PDF coordinate system is rotated relative to
+        what the viewer shows, so we must place the seal at the raw-coordinate
+        position that maps to the visual bottom-right corner:
+
+          Rotate=0   → visual BR = PDF (w-margin, margin)        [normal]
+          Rotate=90  → visual BR = PDF (w-margin, margin)        [same corner in raw coords]
+          Rotate=180 → visual BR = PDF (margin,   h-margin)
+          Rotate=270 → visual BR = PDF (margin,   margin)        [Vijay Kumar Gupta case]
+        """
         buf = io.BytesIO()
         c   = rl_canvas.Canvas(buf, pagesize=(w_pt, h_pt))
 
-        seal_sz = max(60, min(160, int(min(w_pt, h_pt) * 0.21)))
-        x = w_pt - SEAL_MARGIN_PT - seal_sz
-        y = SEAL_MARGIN_PT
+        # Use visual dimensions to size the seal proportionally
+        vis_w = h_pt if rotation in (90, 270) else w_pt
+        vis_h = w_pt if rotation in (90, 270) else h_pt
+        seal_sz = max(60, min(160, int(min(vis_w, vis_h) * 0.21)))
 
+        # Placement in raw PDF coordinates → maps to visual bottom-right
+        if rotation == 180:
+            x = SEAL_MARGIN_PT
+            y = h_pt - SEAL_MARGIN_PT - seal_sz
+        elif rotation == 270:
+            # Rotate=270: PDF origin is at visual top-right.
+            # Visual bottom-right → raw bottom-left = (margin, margin)
+            x = SEAL_MARGIN_PT
+            y = SEAL_MARGIN_PT
+        else:
+            # rotation == 0 or 90 (or anything else)
+            x = w_pt - SEAL_MARGIN_PT - seal_sz
+            y = SEAL_MARGIN_PT
+
+        # Auto-crop white/solid background from seal image
         rgba = seal_img.convert("RGBA")
         _w, _h = rgba.size
         _px    = rgba.load()
@@ -586,10 +617,11 @@ class BatchWorker(QThread):
     def _build_filename(fp: Path, page_idx: int, folios: list, amc: str = "") -> str:
         """
         Build output TIFF filename from folio list.
-        Single folio:    11105259-37.tiff
-        Multiple folios: 26951654-67(8).tiff
-        Same folio 3x:   34867057(3).tiff
-        No folio found:  originalname_page1_sealed.tiff
+        Single folio:    DSP_11105259-37.tiff
+        Multiple folios: ICICI_26951654-67(8).tiff
+        Same folio 3x:   HDFC_34867057(3).tiff
+        No AMC:          11105259-37.tiff
+        No folio:        originalname_page1_sealed.tiff
         """
         if not folios:
             return f"{fp.stem}_page{page_idx + 1}_sealed.tiff"
@@ -645,7 +677,7 @@ class BatchWorker(QThread):
                 break
             dpi = new_dpi
 
-        # Last resort
+        # Last resort — save whatever size we have
         size = buf.tell()
         buf.seek(0)
         out_path.write_bytes(buf.getvalue())
@@ -703,10 +735,14 @@ class BatchWorker(QThread):
                     tmp = Path(tmp_dir)
                     writer = PdfWriter()
                     for page in rdr.pages:
-                        pw = float(page.mediabox.width)
-                        ph = float(page.mediabox.height)
+                        pw  = float(page.mediabox.width)
+                        ph  = float(page.mediabox.height)
+                        # Read rotation metadata — pass raw dimensions AND rotation
+                        # to _make_seal_overlay so it places seal at visual bottom-right.
+                        # Do NOT swap pw/ph here; _make_seal_overlay works in raw PDF coords.
+                        rot = int(page.get("/Rotate", 0) or 0)
                         overlay = PdfReader(
-                            io.BytesIO(self._make_seal_overlay(pw, ph, seal_img))
+                            io.BytesIO(self._make_seal_overlay(pw, ph, seal_img, rot))
                         ).pages[0]
                         page.merge_page(overlay)
                         writer.add_page(page)
