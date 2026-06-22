@@ -51,11 +51,9 @@ except ImportError:
 
 # ── Bundled paths (PyInstaller .exe) ─────────────────────────────────────────
 if getattr(sys, 'frozen', False):
-    # Poppler
     _poppler_path = os.path.join(sys._MEIPASS, 'poppler', 'bin')
     if not os.path.exists(_poppler_path):
         _poppler_path = None
-    # Tesseract — set path so subprocess can find it
     _tess_path = os.path.join(sys._MEIPASS, 'tesseract', 'tesseract.exe')
     if os.path.exists(_tess_path):
         os.environ['PATH'] = os.path.join(sys._MEIPASS, 'tesseract') + os.pathsep + os.environ.get('PATH', '')
@@ -84,11 +82,20 @@ FOLIO_SKIP_WORDS = {
     "fields", "except", "filled", "only", "if", "all"
 }
 
-# ── AMC corrections ─────────────────────────────────────────────────────────
+# ── AMC corrections ──────────────────────────────────────────────────────────
+# Keys are upper-cased OCR output; values are the correct AMC string.
+# Multi-word keys handle cases where OCR garbles a letter inside a longer name.
 AMC_CORRECTIONS = {
-    'ICICL':  'ICICI',
-    'CICI':   'ICICI',
-    'HDEC':   'HDFC',
+    # Single-token fixes
+    'ICICL':                'ICICI',
+    'CICI':                 'ICICI',
+    'HDEC':                 'HDFC',
+    # Multi-word fixes — ICICI PRUDENTIAL misreads
+    'ICICL PRUDENTIAL':     'ICICI_PRUDENTIAL',
+    'ICIC PRUDENTIAL':      'ICICI_PRUDENTIAL',
+    'ICICI PRUDENTIAL':     'ICICI_PRUDENTIAL',
+    'ICICI PRU':            'ICICI_PRU',
+    'ICICL PRU':            'ICICI_PRU',
 }
 
 # ── Known AMC list for fallback matching ─────────────────────────────────────
@@ -347,38 +354,31 @@ class BatchWorker(QThread):
         w_pt, h_pt  — raw PDF page dimensions (from mediabox, NOT swapped)
         rotation    — value of /Rotate key (0, 90, 180, 270)
 
-        For rotated pages the PDF coordinate system is rotated relative to
-        what the viewer shows, so we must place the seal at the raw-coordinate
-        position that maps to the visual bottom-right corner:
-
-          Rotate=0   → visual BR = PDF (w-margin, margin)        [normal]
-          Rotate=90  → visual BR = PDF (w-margin, margin)        [same corner in raw coords]
-          Rotate=180 → visual BR = PDF (margin,   h-margin)
-          Rotate=270 → visual BR = PDF (margin,   margin)        [Vijay Kumar Gupta case]
+        Placement in raw PDF coordinates that maps to visual bottom-right:
+          Rotate=0   → (w-margin, margin)
+          Rotate=90  → (w-margin, margin)
+          Rotate=180 → (margin,   h-margin)
+          Rotate=270 → (margin,   margin)    ← Vijay Kumar Gupta case
         """
         buf = io.BytesIO()
         c   = rl_canvas.Canvas(buf, pagesize=(w_pt, h_pt))
 
-        # Use visual dimensions to size the seal proportionally
+        # Size seal using visual (post-rotation) dimensions
         vis_w = h_pt if rotation in (90, 270) else w_pt
         vis_h = w_pt if rotation in (90, 270) else h_pt
         seal_sz = max(60, min(160, int(min(vis_w, vis_h) * 0.21)))
 
-        # Placement in raw PDF coordinates → maps to visual bottom-right
         if rotation == 180:
             x = SEAL_MARGIN_PT
             y = h_pt - SEAL_MARGIN_PT - seal_sz
         elif rotation == 270:
-            # Rotate=270: PDF origin is at visual top-right.
-            # Visual bottom-right → raw bottom-left = (margin, margin)
             x = SEAL_MARGIN_PT
             y = SEAL_MARGIN_PT
         else:
-            # rotation == 0 or 90 (or anything else)
             x = w_pt - SEAL_MARGIN_PT - seal_sz
             y = SEAL_MARGIN_PT
 
-        # Auto-crop white/solid background from seal image
+        # Auto-crop solid background from seal image
         rgba = seal_img.convert("RGBA")
         _w, _h = rgba.size
         _px    = rgba.load()
@@ -411,10 +411,9 @@ class BatchWorker(QThread):
         buf.seek(0)
         return buf.getvalue()
 
-    # ── Step 3: Folio extraction ──────────────────────────────────────────────
+    # ── OCR helper ────────────────────────────────────────────────────────────
     @staticmethod
     def _ocr(img: Image.Image, psm: int) -> str:
-        """Run Tesseract via subprocess with 15s timeout."""
         import subprocess as _sp
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
             tmp_path = tmp.name
@@ -433,31 +432,22 @@ class BatchWorker(QThread):
             try: os.unlink(tmp_path)
             except OSError: pass
 
+    # ── Folio helpers ─────────────────────────────────────────────────────────
     @staticmethod
     def _is_folio_line(line: str) -> bool:
-        """Return True if this OCR line looks like a folio number."""
         line = line.strip()
-        # Strip leading noise chars (table borders read as | : [ etc.)
         line = re.sub(r'^[^\d]+', '', line).strip()
         if not line:
             return False
-        # Must start with digit
         if not re.match(r'^\d', line):
             return False
-        # Must contain 6+ consecutive digits
         if not re.search(r'\d{6,}', line):
             return False
-        # Must not contain skip words
         words = re.findall(r'[a-zA-Z]{3,}', line.lower())
         return not any(w in FOLIO_SKIP_WORDS for w in words)
 
     @staticmethod
     def _clean_folio(line: str) -> str:
-        """Extract just the folio number from a line.
-        '| 11105259 / 37'     -> '11105259/37'
-        '501762276477 Sundar' -> '501762276477'
-        '34867057'            -> '34867057'
-        """
         line = line.strip()
         line = re.sub(r'^[^\d]+', '', line).strip()
         m = re.match(r'^(\d[\d\s]*/\s*\d+|\d+)', line)
@@ -470,7 +460,6 @@ class BatchWorker(QThread):
 
     @staticmethod
     def _extract_folios(text: str) -> list:
-        """Filter OCR text line by line. Returns list with duplicates preserved."""
         if not text:
             return []
         folios = []
@@ -483,46 +472,77 @@ class BatchWorker(QThread):
 
     @staticmethod
     def _get_crop(img: Image.Image, x_pct: float) -> Image.Image:
-        """Crop and preprocess the folio column area for OCR."""
         w, h = img.size
-        # Fixed y: 5%-38% = folio table area
         crop = img.crop((0, int(h * 0.05), int(w * x_pct), int(h * 0.38)))
         cw, ch = crop.size
-        # Skip first 8% of crop = shaded "Folio No (Mandatory)" header row
-        data = crop.crop((0, int(ch * 0.08), cw, ch))
-        # Upscale 2x
+        data    = crop.crop((0, int(ch * 0.08), cw, ch))
         data_up = data.resize((data.width * 2, data.height * 2), Image.LANCZOS)
-        # Preprocess: grayscale + contrast + sharpen
-        proc = data_up.convert("L")
-        proc = ImageEnhance.Contrast(proc).enhance(2.0)
-        proc = proc.filter(ImageFilter.SHARPEN)
+        proc    = data_up.convert("L")
+        proc    = ImageEnhance.Contrast(proc).enhance(2.0)
+        proc    = proc.filter(ImageFilter.SHARPEN)
         return proc
 
+    # ── AMC helpers ───────────────────────────────────────────────────────────
     TITLE_WORDS = {"request", "change", "distribution", "distributor", "mfd"}
 
     @staticmethod
     def _parse_amc(text: str) -> str:
-        """Parse AMC name from OCR text of mutual fund line."""
-        for line in text.splitlines():
-            line = line.strip()
+        """
+        Parse AMC name from OCR text.
+
+        Handles three OCR failure modes seen on ICICI PRUDENTIAL forms:
+          1. Trailing-l:  'ICICl PRUDENTIAL Mutual Fund'  → AMC_CORRECTIONS fixes ICICL
+          2. Pipe char:   'ICIC| PRUDENTIAL Mutual Fund'  → | replaced with I before match
+          3. Split-line:  'ICICI PRUDENTIAL' / blank / 'Mutual Fund'
+                          → lookahead to next non-empty line (PSM11 output style)
+        """
+        lines = text.splitlines()
+        # Pre-process: replace pipe chars, drop empty lines, keep index
+        non_empty = [
+            (i, re.sub(r'\|', 'I', l.strip()))
+            for i, l in enumerate(lines) if l.strip()
+        ]
+
+        for pos, (_, line) in enumerate(non_empty):
             if 'mutual' in line.lower() and 'fund' in line.lower():
                 if any(w in line.lower() for w in BatchWorker.TITLE_WORDS):
                     continue
-                line = re.sub(r'^[_\W]+', '', line)
+                clean = re.sub(r'^[_\W]+', '', line)
                 m = re.match(r'^([\w\-]+(?:\s+[\w\-]+)*?)\s*[_.:]*\s*Mutual',
-                             line, re.IGNORECASE)
+                             clean, re.IGNORECASE)
                 if m:
                     amc = re.sub(r'[_\s\.]+$', '', m.group(1)).strip()
                     if not amc or len(amc) < 2:
                         continue
-                    amc = amc.upper()
-                    amc = re.sub(r'l$', 'I', amc)
-                    return AMC_CORRECTIONS.get(amc, amc)
+                    amc    = amc.upper()
+                    parts  = amc.split()
+                    parts[0] = AMC_CORRECTIONS.get(parts[0], parts[0])
+                    amc    = AMC_CORRECTIONS.get(' '.join(parts), ' '.join(parts))
+                    return amc
+            else:
+                # Split-line lookahead — handles PSM11 blank-line separation
+                if pos + 1 < len(non_empty):
+                    next_line = non_empty[pos + 1][1]
+                    combined  = line + ' ' + next_line
+                    if 'mutual' in combined.lower() and 'fund' in combined.lower():
+                        if any(w in combined.lower() for w in BatchWorker.TITLE_WORDS):
+                            continue
+                        combined = re.sub(r'^[_\W]+', '', combined)
+                        m = re.match(r'^([\w\-]+(?:\s+[\w\-]+)*?)\s*[_.:]*\s*Mutual',
+                                     combined, re.IGNORECASE)
+                        if m:
+                            amc = re.sub(r'[_\s\.]+$', '', m.group(1)).strip()
+                            if not amc or len(amc) < 2:
+                                continue
+                            amc    = amc.upper()
+                            parts  = amc.split()
+                            parts[0] = AMC_CORRECTIONS.get(parts[0], parts[0])
+                            amc    = AMC_CORRECTIONS.get(' '.join(parts), ' '.join(parts))
+                            return amc
         return ""
 
     @staticmethod
     def _find_known_amc(text: str) -> str:
-        """Fallback: scan OCR text for known AMC names."""
         text_upper = text.upper()
         for amc in KNOWN_AMCS:
             pattern = r'\b' + re.escape(amc) + r'\b'
@@ -532,15 +552,14 @@ class BatchWorker(QThread):
 
     @staticmethod
     def _get_amc(img: Image.Image) -> str:
-        """Extract AMC name from page top area."""
         w, h = img.size
         all_text = ""
         for y1_pct, y2_pct in [(0.08, 0.15), (0.06, 0.16), (0.05, 0.18)]:
-            crop = img.crop((0, int(h*y1_pct), int(w*0.70), int(h*y2_pct)))
+            crop    = img.crop((0, int(h*y1_pct), int(w*0.70), int(h*y2_pct)))
             crop_up = crop.resize((crop.width*2, crop.height*2), Image.LANCZOS)
-            proc = crop_up.convert("L")
-            proc = ImageEnhance.Contrast(proc).enhance(2.0)
-            proc = proc.filter(ImageFilter.SHARPEN)
+            proc    = crop_up.convert("L")
+            proc    = ImageEnhance.Contrast(proc).enhance(2.0)
+            proc    = proc.filter(ImageFilter.SHARPEN)
             for psm in (4, 6, 11):
                 text = BatchWorker._ocr(proc, psm)
                 all_text += text
@@ -549,11 +568,8 @@ class BatchWorker(QThread):
                     return amc
         return BatchWorker._find_known_amc(all_text)
 
+    # ── Main extraction ───────────────────────────────────────────────────────
     def _get_folios_and_amc(self, pdf_bytes: bytes, page_idx: int) -> tuple:
-        """
-        Extract folio numbers and AMC name from one page.
-        Returns (folios_list, amc_string)
-        """
         if not PDF2IMAGE_OK:
             return [], ""
         try:
@@ -571,17 +587,13 @@ class BatchWorker(QThread):
                 except OSError: pass
 
             img = pages[0]
-
-            # Extract AMC name
             amc = self._get_amc(img)
 
-            # Build both crops upfront
             crops = {
                 0.38: self._get_crop(img, 0.38),
                 0.22: self._get_crop(img, 0.22),
             }
 
-            # Try PSM × width combinations, stop at first success
             folios   = []
             all_text = ""
             for psm in (6, 4, 11):
@@ -596,7 +608,6 @@ class BatchWorker(QThread):
                 if folios:
                     break
 
-            # If AMC not found from dedicated strip, try from folio OCR text
             if not amc and all_text:
                 amc = self._parse_amc(all_text)
                 if not amc:
@@ -608,46 +619,31 @@ class BatchWorker(QThread):
             return [], ""
 
     def _get_folios(self, pdf_bytes: bytes, page_idx: int) -> list:
-        """Kept for backward compatibility — use _get_folios_and_amc instead."""
         folios, _ = self._get_folios_and_amc(pdf_bytes, page_idx)
         return folios
 
-    # ── Step 5: Build output filename ────────────────────────────────────────
+    # ── Filename builder ──────────────────────────────────────────────────────
     @staticmethod
     def _build_filename(fp: Path, page_idx: int, folios: list, amc: str = "") -> str:
-        """
-        Build output TIFF filename from folio list.
-        Single folio:    DSP_11105259-37.tiff
-        Multiple folios: ICICI_26951654-67(8).tiff
-        Same folio 3x:   HDFC_34867057(3).tiff
-        No AMC:          11105259-37.tiff
-        No folio:        originalname_page1_sealed.tiff
-        """
         if not folios:
             return f"{fp.stem}_page{page_idx + 1}_sealed.tiff"
         first = folios[0]
         first = re.sub(r'(?<=\d)\s+(?=\d)', '', first)
         first = re.sub(r'\s*/\s*', '-', first)
         first = re.sub(r'[^\w\-]', '', first).strip('-_')
-        count = len(folios)
+        count      = len(folios)
         folio_part = f"{first}({count})" if count > 1 else first
         if amc:
             amc_clean = re.sub(r'\s+', '_', amc)
             return f"{amc_clean}_{folio_part}.tiff"
         return f"{folio_part}.tiff"
 
-    # ── Step 4+6: Render sealed TIFF and save ────────────────────────────────
+    # ── Render + save ─────────────────────────────────────────────────────────
     def _render_and_save(self, fp: Path, page_idx: int,
                          sealed_pdf: Path, folios: list, amc: str = "") -> tuple:
-        """
-        Render one page of sealed PDF to TIFF under 5MB.
-        Saves to output_folder.
-        Returns (out_path, size_mb, display_name).
-        """
         out_name = self._build_filename(fp, page_idx, folios, amc)
         display  = out_name if folios else ""
 
-        # Collision-safe naming
         out_path = self.output_folder / out_name
         counter  = 1
         base     = out_name.replace(".tiff", "")
@@ -655,7 +651,6 @@ class BatchWorker(QThread):
             out_path = self.output_folder / f"{base}_{counter}.tiff"
             counter += 1
 
-        # Render with DPI reduction to stay under 5MB
         dpi = RENDER_DPI_START
         buf = None
         while dpi >= RENDER_DPI_MIN:
@@ -677,7 +672,6 @@ class BatchWorker(QThread):
                 break
             dpi = new_dpi
 
-        # Last resort — save whatever size we have
         size = buf.tell()
         buf.seek(0)
         out_path.write_bytes(buf.getvalue())
@@ -691,7 +685,6 @@ class BatchWorker(QThread):
         self.batch_progress.emit(0, "Loading seal image…")
         seal_img = Image.open(self.seal_path).convert("RGBA")
 
-        # Count total pages for progress bar
         total_pages      = 0
         file_page_counts = []
         for fp in self.input_files:
@@ -711,12 +704,10 @@ class BatchWorker(QThread):
                 int(100 * pages_done / max(total_pages, 1)),
                 f"Processing {fp.name}  ({file_idx + 1}/{n_files})…")
             try:
-                # Step 1: Convert to PDF
                 pdf_bytes = self._file_to_pdf_bytes(fp)
                 rdr       = PdfReader(io.BytesIO(pdf_bytes))
                 n_pages   = len(rdr.pages)
 
-                # Step 2: Extract folios for ALL pages first (fast OCR pass)
                 self.batch_progress.emit(
                     int(100 * pages_done / max(total_pages, 1)),
                     f"{fp.name} — extracting folios…")
@@ -730,16 +721,12 @@ class BatchWorker(QThread):
                     all_folios.append(folios)
                     all_amcs.append(amc)
 
-                # Step 3: Seal all pages into one sealed PDF
                 with tempfile.TemporaryDirectory() as tmp_dir:
-                    tmp = Path(tmp_dir)
+                    tmp    = Path(tmp_dir)
                     writer = PdfWriter()
                     for page in rdr.pages:
                         pw  = float(page.mediabox.width)
                         ph  = float(page.mediabox.height)
-                        # Read rotation metadata — pass raw dimensions AND rotation
-                        # to _make_seal_overlay so it places seal at visual bottom-right.
-                        # Do NOT swap pw/ph here; _make_seal_overlay works in raw PDF coords.
                         rot = int(page.get("/Rotate", 0) or 0)
                         overlay = PdfReader(
                             io.BytesIO(self._make_seal_overlay(pw, ph, seal_img, rot))
@@ -751,7 +738,6 @@ class BatchWorker(QThread):
                     with open(str(sealed_pdf), "wb") as fh:
                         writer.write(fh)
 
-                    # Step 4: Render each page to TIFF using known filenames
                     for page_idx in range(n_pages):
                         self.batch_progress.emit(
                             int(100 * pages_done / max(total_pages, 1)),
@@ -762,8 +748,7 @@ class BatchWorker(QThread):
                                 fp, page_idx, sealed_pdf,
                                 all_folios[page_idx], all_amcs[page_idx])
                             successes += 1
-                            self.page_done.emit(
-                                file_idx, page_idx, size_mb, display)
+                            self.page_done.emit(file_idx, page_idx, size_mb, display)
                         except Exception:
                             import traceback
                             failures += 1
