@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 DocSealer Batch — Desktop App
-Each input file (JPG / PNG / HEIC / PDF / …) → one sealed TIFF per page.
+Each input file (JPG / PNG / HEIC / PDF / TIFF / …) → one sealed TIFF per page.
 Output TIFFs are named after the folio number found on that page.
 If no folio found → falls back to originalname_pageN_sealed.tiff
 Run: python3 doc_sealer_batch.py
@@ -83,8 +83,6 @@ FOLIO_SKIP_WORDS = {
 }
 
 # ── AMC corrections ──────────────────────────────────────────────────────────
-# Keys are upper-cased OCR output; values are the correct AMC string.
-# Multi-word keys handle cases where OCR garbles a letter inside a longer name.
 AMC_CORRECTIONS = {
     # Single-token fixes
     'ICICL':                'ICICI',
@@ -333,17 +331,40 @@ class BatchWorker(QThread):
     def _file_to_pdf_bytes(self, fp: Path) -> bytes:
         if fp.suffix.lower() == ".pdf":
             return fp.read_bytes()
+
         img = Image.open(fp)
-        if img.mode not in ("RGB", "L"):
-            img = img.convert("RGB")
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-            tmp_path = tmp.name
+
+        # Extract ALL frames — critical for multi-frame TIFFs.
+        # Single-frame formats (JPG, PNG, BMP, WEBP, HEIC) loop once and exit.
+        frames = []
         try:
-            img.save(tmp_path, format="PNG")
-            return img2pdf.convert(tmp_path)
+            while True:
+                frame = img.copy()
+                if frame.mode not in ("RGB", "L"):
+                    frame = frame.convert("RGB")
+                frames.append(frame)
+                img.seek(img.tell() + 1)
+        except EOFError:
+            pass
+
+        if not frames:
+            # Fallback — should never happen but be safe
+            frame = img.convert("RGB") if img.mode not in ("RGB", "L") else img
+            frames = [frame]
+
+        tmp_paths = []
+        try:
+            for frame in frames:
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                    tmp_path = tmp.name
+                frame.save(tmp_path, format="PNG")
+                tmp_paths.append(tmp_path)
+            # img2pdf.convert accepts a list → produces one page per image
+            return img2pdf.convert(tmp_paths)
         finally:
-            try: os.unlink(tmp_path)
-            except OSError: pass
+            for p in tmp_paths:
+                try: os.unlink(p)
+                except OSError: pass
 
     # ── Step 2: Apply seal overlay ────────────────────────────────────────────
     def _make_seal_overlay(self, w_pt: float, h_pt: float,
@@ -435,19 +456,32 @@ class BatchWorker(QThread):
     # ── Folio helpers ─────────────────────────────────────────────────────────
     @staticmethod
     def _is_folio_line(line: str) -> bool:
+        """
+        Return True if this OCR line looks like a folio number.
+
+        IMPORTANT: skip-word check happens on the ORIGINAL line before stripping
+        leading non-digits. This catches ARN-341934 (which becomes '341934' after
+        strip — losing the 'ARN' prefix that identifies it as non-folio).
+        """
         line = line.strip()
+        # Check skip words on original line FIRST (before stripping prefix)
+        words_orig = re.findall(r'[a-zA-Z]{3,}', line.lower())
+        if any(w in FOLIO_SKIP_WORDS for w in words_orig):
+            return False
+        # Now strip leading noise chars (table borders: | : [ etc.)
         line = re.sub(r'^[^\d]+', '', line).strip()
         if not line:
             return False
         if not re.match(r'^\d', line):
             return False
+        # Must contain 6+ consecutive digits
         if not re.search(r'\d{6,}', line):
             return False
-        words = re.findall(r'[a-zA-Z]{3,}', line.lower())
-        return not any(w in FOLIO_SKIP_WORDS for w in words)
+        return True
 
     @staticmethod
     def _clean_folio(line: str) -> str:
+        """Extract just the folio number from a line."""
         line = line.strip()
         line = re.sub(r'^[^\d]+', '', line).strip()
         m = re.match(r'^(\d[\d\s]*/\s*\d+|\d+)', line)
@@ -490,14 +524,14 @@ class BatchWorker(QThread):
         """
         Parse AMC name from OCR text.
 
-        Handles three OCR failure modes seen on ICICI PRUDENTIAL forms:
-          1. Trailing-l:  'ICICl PRUDENTIAL Mutual Fund'  → AMC_CORRECTIONS fixes ICICL
-          2. Pipe char:   'ICIC| PRUDENTIAL Mutual Fund'  → | replaced with I before match
+        Handles three OCR failure modes:
+          1. Trailing-l:  'ICICl PRUDENTIAL Mutual Fund' → corrections table fixes ICICL
+          2. Pipe char:   'ICIC| PRUDENTIAL Mutual Fund' → | replaced with I before match
           3. Split-line:  'ICICI PRUDENTIAL' / blank / 'Mutual Fund'
                           → lookahead to next non-empty line (PSM11 output style)
         """
         lines = text.splitlines()
-        # Pre-process: replace pipe chars, drop empty lines, keep index
+        # Pre-process: replace pipe chars, drop empty, keep position for lookahead
         non_empty = [
             (i, re.sub(r'\|', 'I', l.strip()))
             for i, l in enumerate(lines) if l.strip()
@@ -830,7 +864,6 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(28, 24, 28, 24)
         lay.setSpacing(16)
 
-        # Header
         hdr   = QHBoxLayout()
         title = QLabel("DocSealer Batch")
         title.setStyleSheet(
@@ -860,7 +893,6 @@ class MainWindow(QMainWindow):
         sep.setStyleSheet(f"color: {C['border']};")
         lay.addWidget(sep)
 
-        # Seal row
         seal_row = QHBoxLayout()
         seal_row.setSpacing(16)
         self.seal_preview = SealPreview()
@@ -889,12 +921,10 @@ class MainWindow(QMainWindow):
         seal_row.addStretch()
         lay.addLayout(seal_row)
 
-        # Drop zone
         self.drop_zone = DropZone()
         self.drop_zone.files_dropped.connect(self._add_files)
         lay.addWidget(self.drop_zone)
 
-        # Input file list
         list_hdr = QHBoxLayout()
         self.file_count_lbl = QLabel("Input files (0)")
         self.file_count_lbl.setStyleSheet(
@@ -917,7 +947,6 @@ class MainWindow(QMainWindow):
         self.file_list.setFixedHeight(130)
         lay.addWidget(self.file_list)
 
-        # Output folder
         out_row = QHBoxLayout()
         out_lbl = QLabel("Output folder:")
         out_lbl.setStyleSheet(f"font-size: 12px; color: {C['muted']};")
@@ -935,7 +964,6 @@ class MainWindow(QMainWindow):
         out_row.addWidget(browse_out_btn)
         lay.addLayout(out_row)
 
-        # Run button
         self.run_btn = QPushButton("▶  Start Batch")
         self.run_btn.setFixedHeight(44)
         self.run_btn.setStyleSheet(
@@ -944,7 +972,6 @@ class MainWindow(QMainWindow):
         self.run_btn.clicked.connect(self._run)
         lay.addWidget(self.run_btn)
 
-        # Progress
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         lay.addWidget(self.progress_bar)
@@ -953,7 +980,6 @@ class MainWindow(QMainWindow):
         self.status_lbl.setStyleSheet(f"font-size: 12px; color: {C['muted']}; padding: 2px;")
         lay.addWidget(self.status_lbl)
 
-        # Summary banner
         self.summary_frame = QFrame()
         self.summary_frame.setVisible(False)
         sf_lay = QHBoxLayout(self.summary_frame)
@@ -967,7 +993,6 @@ class MainWindow(QMainWindow):
         sf_lay.addWidget(open_folder_btn)
         lay.addWidget(self.summary_frame)
 
-        # Results list
         self.results_header_lbl = QLabel("Results")
         self.results_header_lbl.setStyleSheet(
             f"font-size: 12px; font-weight: 600; color: {C['text']};")
